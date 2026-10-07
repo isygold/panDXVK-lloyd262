@@ -139,8 +139,12 @@ jobs:
               for dll in dlls:
                   name = os.path.basename(dll)
                   files.append({
-                      "source": f"{arch}/{name}",
-                      "target": "${{{0}}}/{1}".format(arch, name),
+                      "source": "{0}/{1}".format(arch, name),
+                      # Assemble the target by concatenation, never as one
+                      # literal: the workflow parser scans raw text for a
+                      # dollar sign followed by two opening braces and would
+                      # treat it as an expression opener and fail the file.
+                      "target": "$" + "{" + arch + "}/" + name,
                   })
 
           vcode = os.environ["VCODE"]
