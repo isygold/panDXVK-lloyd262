@@ -575,18 +575,53 @@ namespace dxvk {
 
     // VK_FORMAT_A8_UNORM_KHR
     { 1, A, VK_IMAGE_ASPECT_COLOR_BIT },
+
+    // panDXVK: VK_FORMAT_ASTC_4x4_UNORM_BLOCK
+    // Backing format for the BC->ASTC transcode path. Without these two
+    // entries lookupFormatInfoSlow() returns nullptr for ASTC and every
+    // aspectMask / elementSize read dereferences null + 0x0c.
+    { 16, RGBA, VK_IMAGE_ASPECT_COLOR_BIT,
+      DxvkFormatFlag::BlockCompressed,
+      VkExtent3D { 4, 4, 1 } },
+
+    // panDXVK: VK_FORMAT_ASTC_4x4_SRGB_BLOCK
+    { 16, RGBA, VK_IMAGE_ASPECT_COLOR_BIT,
+      DxvkFormatFlags(
+        DxvkFormatFlag::BlockCompressed,
+        DxvkFormatFlag::ColorSpaceSrgb),
+      VkExtent3D { 4, 4, 1 } },
   }};
   
   
-  const std::array<std::pair<VkFormat, VkFormat>, 5> g_formatGroups = {{
+  const std::array<std::pair<VkFormat, VkFormat>, 6> g_formatGroups = {{
     { VK_FORMAT_UNDEFINED,                  VK_FORMAT_BC7_SRGB_BLOCK            },
     { VK_FORMAT_G8B8G8R8_422_UNORM_KHR,     VK_FORMAT_B8G8R8G8_422_UNORM_KHR    },
     { VK_FORMAT_A4R4G4B4_UNORM_PACK16,      VK_FORMAT_A4B4G4R4_UNORM_PACK16     },
     { VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM,  VK_FORMAT_G8_B8R8_2PLANE_420_UNORM  },
     { VK_FORMAT_A1B5G5R5_UNORM_PACK16_KHR,  VK_FORMAT_A8_UNORM_KHR              },
+    // panDXVK: BC->ASTC transcode backing formats, must be the last group so
+    // its two entries sit at the end of g_formatInfos.
+    { VK_FORMAT_ASTC_4x4_UNORM_BLOCK,       VK_FORMAT_ASTC_4x4_SRGB_BLOCK       },
   }};
-  
-  
+
+
+  // panDXVK: lookupFormatInfoSlow() walks g_formatGroups in order, accumulating
+  // each non-matching group's span into indexOffset, then indexes g_formatInfos
+  // with that offset. If the array size and the summed group span ever disagree,
+  // lookups silently land on the wrong entry or off the end of the array, which
+  // is how nullptr reaches the aspectMask / elementSize dereference at
+  // d3d11+0x60731. Keep the two tied together at compile time.
+  static_assert(
+      (uint32_t(VK_FORMAT_BC7_SRGB_BLOCK) - uint32_t(VK_FORMAT_UNDEFINED) + 1)
+    + (uint32_t(VK_FORMAT_B8G8R8G8_422_UNORM_KHR) - uint32_t(VK_FORMAT_G8B8G8R8_422_UNORM_KHR) + 1)
+    + (uint32_t(VK_FORMAT_A4B4G4R4_UNORM_PACK16) - uint32_t(VK_FORMAT_A4R4G4B4_UNORM_PACK16) + 1)
+    + (uint32_t(VK_FORMAT_G8_B8R8_2PLANE_420_UNORM) - uint32_t(VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM) + 1)
+    + (uint32_t(VK_FORMAT_A8_UNORM_KHR) - uint32_t(VK_FORMAT_A1B5G5R5_UNORM_PACK16_KHR) + 1)
+    + (uint32_t(VK_FORMAT_ASTC_4x4_SRGB_BLOCK) - uint32_t(VK_FORMAT_ASTC_4x4_UNORM_BLOCK) + 1)
+    == DxvkFormatCount,
+    "g_formatInfos size must equal the summed span of g_formatGroups");
+
+
   const DxvkFormatInfo* lookupFormatInfoSlow(VkFormat format) {
     uint32_t indexOffset = 0;
     

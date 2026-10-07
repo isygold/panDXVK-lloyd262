@@ -86,8 +86,11 @@ namespace dxvk {
     std::array<DxvkPlaneFormatInfo, 3> planes;
   };
 
-  /// Number of formats defined in lookup table  
-  constexpr size_t DxvkFormatCount = 155;
+  /// Number of formats defined in lookup table
+  // panDXVK: 155 stock + 2 BC->ASTC backing formats (4x4 UNORM / 4x4 SRGB).
+  // This constant, g_formatInfos and g_formatGroups must be updated together;
+  // see the static_assert in dxvk_format.cpp.
+  constexpr size_t DxvkFormatCount = 157;
 
   /// Format lookup table
   extern const std::array<DxvkFormatInfo, DxvkFormatCount> g_formatInfos;
