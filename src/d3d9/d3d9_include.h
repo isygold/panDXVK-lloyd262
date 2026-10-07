@@ -48,12 +48,19 @@
 #define D3DSWAPEFFECT_COPY_VSYNC 4
 #endif
 
-// MinGW headers are broken. Who'dve guessed?
+// Newer MinGW (fedora:44 mingw-w64) already defines
+// _D3DDEVINFO_RESOURCEMANAGER in d3d9types.h, so declaring the stub in the
+// global namespace is a redefinition. Scope it to namespace dxvk instead:
+// the only consumer, D3D9Query::GetDataSize(), also lives in namespace dxvk
+// and resolves the name unqualified, so it picks this stub first and
+// sizeof() keeps its original result.
 #ifndef _MSC_VER
-typedef struct _D3DDEVINFO_RESOURCEMANAGER
-{
-  char dummy;
-} D3DDEVINFO_RESOURCEMANAGER, * LPD3DDEVINFO_RESOURCEMANAGER;
+namespace dxvk {
+  typedef struct _D3DDEVINFO_RESOURCEMANAGER
+  {
+    char dummy;
+  } D3DDEVINFO_RESOURCEMANAGER, * LPD3DDEVINFO_RESOURCEMANAGER;
+}
 #endif
 
 // This is the managed pool on D3D9Ex, it's just hidden!
