@@ -5,7 +5,7 @@ set -e
 shopt -s extglob
 
 if [ -z "$1" ] || [ -z "$2" ]; then
-  echo "Usage: $0 version destdir [--no-package] [--dev-build]"
+  echo "Usage: $0 version destdir [--no-package] [--dev-build] [--build-id] [--64-only|--32-only]"
   exit 1
 fi
 
@@ -25,6 +25,11 @@ shift 2
 opt_nopackage=0
 opt_devbuild=0
 opt_buildid=false
+# panDXVK: let CI build one architecture per job so x64 and x32 run in
+# parallel and can be merged afterwards. With neither flag set the script
+# behaves exactly as upstream does and builds both.
+opt_64only=0
+opt_32only=0
 
 crossfile="build-win"
 
@@ -39,6 +44,12 @@ while [ $# -gt 0 ]; do
     ;;
   "--build-id")
     opt_buildid=true
+    ;;
+  "--64-only")
+    opt_64only=1
+    ;;
+  "--32-only")
+    opt_32only=1
     ;;
   *)
     echo "Unrecognized option: $1" >&2
@@ -83,8 +94,14 @@ function package {
   rm -R "dxvk-$DXVK_VERSION"
 }
 
-build_arch 64
-build_arch 32
+# panDXVK: build only the architectures that were not excluded.
+# Neither flag -> both, same as upstream.
+if [ $opt_32only -eq 0 ]; then
+  build_arch 64
+fi
+if [ $opt_64only -eq 0 ]; then
+  build_arch 32
+fi
 
 if [ $opt_nopackage -eq 0 ]; then
   package

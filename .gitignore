@@ -1,0 +1,3 @@
+# Host-native ASTC spec gate. Built by CI and locally as a bare binary at the
+# repo root; never a source file.
+/rmchk
