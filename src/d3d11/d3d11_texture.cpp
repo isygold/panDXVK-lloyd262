@@ -4,6 +4,7 @@
 
 #include "../util/util_shared_res.h"
 #include "../util/util_win32_compat.h"
+#include "../util/util_bc_to_astc.h"
 
 namespace dxvk {
   
@@ -23,6 +24,38 @@ namespace dxvk {
     DXGI_VK_FORMAT_FAMILY formatFamily = m_device->LookupFamily(m_desc.Format, formatMode);
     DXGI_VK_FORMAT_INFO   formatPacked = m_device->LookupPackedFormat(m_desc.Format, formatMode);
     m_packedFormat = formatPacked.Format;
+
+    // panDXVK: Remap BC formats to ASTC on PanVK/Mali
+    // BC textureCompressionBC is not supported on panVK.
+    // Skip if the driver already supports BC (blob driver on G610+).
+    VkFormat astcFormat = VK_FORMAT_UNDEFINED;
+    // panDXVK: gate lives in DxvkAdapter::isPanVkTranscode() so the texture,
+    // RTV and SRV constructors cannot drift apart.
+    if (m_device->GetDXVKDevice()->adapter()->isPanVkTranscode()
+        && util::isBcFormat(m_desc.Format)) {
+      astcFormat = util::bcToAstcFormat(m_desc.Format);
+      if (astcFormat != VK_FORMAT_UNDEFINED) {
+        // Functional marker, not a diagnostic: this is the only line in a
+        // tester log that proves the gate opened and a VkImage was remapped.
+        // Deliberately kept OUT of #ifndef NDEBUG so release builds still
+        // emit it, but gated on the runtime log level so the default build
+        // pays nothing - no string is built unless debug logging is on.
+        if (Logger::logLevel() >= LogLevel::Debug) {
+          Logger::debug(str::format(
+            "panDXVK: BC→ASTC remap VkImage ",
+            m_desc.Width, "x", m_desc.Height, " ",
+            "DXGI_FORMAT=", m_desc.Format, " → ASTC_4x4"));
+        }
+        formatInfo.Format = astcFormat;
+        formatFamily.FormatCount = 1;
+        formatFamily.Formats[0] = astcFormat;
+        // panDXVK: m_transcodedFormat is intentionally NOT set here.
+        // The remap only takes effect once we know the texture will own a
+        // real VkImage (map mode != STAGING). Staging resources stay pure
+        // BC end-to-end: they hold BC bytes and report BC layout/pitch.
+        // See the gate after DetermineMapMode() below.
+      }
+    }
 
     DxvkImageCreateInfo imageInfo;
     imageInfo.type            = GetVkImageType();
@@ -169,7 +202,28 @@ namespace dxvk {
     
     // Determine map mode based on our findings
     m_mapMode = DetermineMapMode(&imageInfo);
-    
+
+    // panDXVK: BC→ASTC remap gate.
+    //
+    // v5 rule: the remap is only recorded for textures that will own a
+    // VkImage (map mode != STAGING). Staging textures keep GetDataFormat()
+    // == GetPackedFormat() (BC), so their layout math, UpdateTexture gate
+    // and CopyImage branches all see them as non-remapped.
+    //
+    // Additionally we force DIRECT -> BUFFER for remapped textures. Linear
+    // tiling with ASTC image format would otherwise hand the app ASTC pitches
+    // from querySubresourceLayout while the mapped host buffer is filled via
+    // BC paths, and HOST_VISIBLE ASTC storage is not a Mali use case anyway.
+    // Forcing BUFFER also makes Hole #1 (InitHostVisibleTexture) structurally
+    // unreachable for remapped textures.
+    if (astcFormat != VK_FORMAT_UNDEFINED) {
+      if (m_mapMode != D3D11_COMMON_TEXTURE_MAP_MODE_STAGING) {
+        m_transcodedFormat = astcFormat;
+        if (m_mapMode == D3D11_COMMON_TEXTURE_MAP_MODE_DIRECT)
+          m_mapMode = D3D11_COMMON_TEXTURE_MAP_MODE_BUFFER;
+      }
+    }
+
     // If the image is mapped directly to host memory, we need
     // to enable linear tiling, and DXVK needs to be aware that
     // the image can be accessed by the host.

@@ -1,7 +1,10 @@
 #include <cstring>
+#include <memory>
 
 #include "d3d11_device.h"
 #include "d3d11_initializer.h"
+
+#include "../util/util_bc_to_astc.h"
 
 namespace dxvk {
 
@@ -135,6 +138,11 @@ namespace dxvk {
     VkFormat packedFormat = m_parent->LookupPackedFormat(desc->Format, pTexture->GetFormatMode()).Format;
     auto formatInfo = lookupFormatInfo(packedFormat);
 
+    // panDXVK v5: is this texture's VkImage ASTC rather than BC?
+    // Staging textures never report remapped (they have no image), so they
+    // take the plain BC path on every branch below.
+    const bool remapped = pTexture->GetDataFormat() != packedFormat;
+
     if (pInitialData != nullptr && pInitialData->pSysMem != nullptr) {
       // pInitialData is an array that stores an entry for
       // every single subresource. Since we will define all
@@ -147,6 +155,14 @@ namespace dxvk {
           VkOffset3D mipLevelOffset = { 0, 0, 0 };
           VkExtent3D mipLevelExtent = pTexture->MipLevelExtent(level);
 
+          // panDXVK v5: the two ingress seams below must NOT share data.
+          //
+          //  * image upload — the VkImage is ASTC, the initial data is BC,
+          //    so transcode here, once per depth slice (transcode is 2D-only).
+          //  * mapped-buffer pack — the buffer is app-visible storage and
+          //    always holds BC bytes, so pack the ORIGINAL data with BC
+          //    layout. Packing transcoded ASTC into it would overrun the
+          //    BC-sized allocation as well as lie to Map().
           if (mapMode != D3D11_COMMON_TEXTURE_MAP_MODE_STAGING) {
             m_transferCommands += 1;
             m_transferMemory   += pTexture->GetSubresourceLayout(formatInfo->aspectMask, id).Size;
@@ -158,11 +174,60 @@ namespace dxvk {
             subresourceLayers.layerCount     = 1;
             
             if (formatInfo->aspectMask != (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) {
+              const void*  uploadData       = pInitialData[id].pSysMem;
+              VkDeviceSize uploadPitch      = pInitialData[id].SysMemPitch;
+              VkDeviceSize uploadSlicePitch = pInitialData[id].SysMemSlicePitch;
+              std::unique_ptr<uint8_t[]> transcoded;
+
+              if (remapped) {
+                VkDeviceSize astcSlicePitch = util::computeAstcImageDataSize(
+                  mipLevelExtent.width, mipLevelExtent.height);
+
+                transcoded = std::make_unique<uint8_t[]>(
+                  static_cast<size_t>(astcSlicePitch * mipLevelExtent.depth));
+
+                auto* astcPtr = transcoded.get();
+
+                for (uint32_t z = 0; z < mipLevelExtent.depth; z++) {
+                  util::transcodeBcToAstc(desc->Format,
+                    static_cast<const uint8_t*>(pInitialData[id].pSysMem)
+                      + VkDeviceSize(z) * pInitialData[id].SysMemSlicePitch,
+                    mipLevelExtent.width, mipLevelExtent.height,
+                    pInitialData[id].SysMemPitch,
+                    astcPtr + z * astcSlicePitch,
+                    0 /* dstRowPitch 0 → core derives tight ASTC row pitch */);
+                }
+
+                uploadData       = transcoded.get();
+                uploadPitch      = ((static_cast<VkDeviceSize>(mipLevelExtent.width) + 3) / 4) * 16;
+                uploadSlicePitch = astcSlicePitch;
+
+                // Metric: which subresource the initializer transcode
+                // consumed. The UpdateSubresource1 path owns the only other
+                // transcode logging (timings + force notice), so without this
+                // line a title that only ever calls the initializer shows zero
+                // transcode evidence and is indistinguishable from a gate that
+                // never opened. Fires once per layer/mip at resource creation,
+                // never per frame. Deliberately NOT inside #ifndef NDEBUG:
+                // this is functional evidence, not a diagnostic, and release
+                // builds must still be able to prove the transcode ran. The
+                // runtime log-level check keeps it free by default.
+                if (Logger::logLevel() >= LogLevel::Debug) {
+                  Logger::debug(str::format(
+                    "panDXVK: BC→ASTC initializer upload ",
+                    mipLevelExtent.width, "x", mipLevelExtent.height,
+                    " depth=", mipLevelExtent.depth,
+                    " DXGI_FORMAT=", desc->Format,
+                    " mip=", level, " layer=", layer,
+                    " ", astcSlicePitch * mipLevelExtent.depth, "B"));
+                }
+              }
+
               m_context->uploadImage(
                 image, subresourceLayers,
-                pInitialData[id].pSysMem,
-                pInitialData[id].SysMemPitch,
-                pInitialData[id].SysMemSlicePitch);
+                uploadData,
+                uploadPitch,
+                uploadSlicePitch);
             } else {
               m_context->updateDepthStencilImage(
                 image, subresourceLayers,
