@@ -113,30 +113,49 @@ jobs:
           mv x32 syswow64
 
       - name: Package WCP
+        env:
+          VNAME: ${{ steps.version.outputs.version_name }}
+          VCODE: ${{ steps.version.outputs.version_code }}
+          VDESC: ${{ inputs.release_description }}
         run: |
+          set -euo pipefail
           cd ./workdir
-          cat > profile.json << 'JSONEOF'
-          {
-            "type": "DXVK",
-            "versionName": "pandxvk-${{ steps.version.outputs.version_name }}",
-            "versionCode": ${{ steps.version.outputs.version_code }},
-            "description": "${{ inputs.release_description }}",
-            "files": [
-              {"source": "system32/d3d9.dll",      "target": "${system32}/d3d9.dll"},
-              {"source": "system32/d3d10.dll",     "target": "${system32}/d3d10.dll"},
-              {"source": "system32/d3d10_1.dll",   "target": "${system32}/d3d10_1.dll"},
-              {"source": "system32/d3d10core.dll", "target": "${system32}/d3d10core.dll"},
-              {"source": "system32/d3d11.dll",     "target": "${system32}/d3d11.dll"},
-              {"source": "system32/dxgi.dll",      "target": "${system32}/dxgi.dll"},
-              {"source": "syswow64/d3d9.dll",      "target": "${syswow64}/d3d9.dll"},
-              {"source": "syswow64/d3d10.dll",     "target": "${syswow64}/d3d10.dll"},
-              {"source": "syswow64/d3d10_1.dll",   "target": "${syswow64}/d3d10_1.dll"},
-              {"source": "syswow64/d3d10core.dll", "target": "${syswow64}/d3d10core.dll"},
-              {"source": "syswow64/d3d11.dll",     "target": "${syswow64}/d3d11.dll"},
-              {"source": "syswow64/dxgi.dll",      "target": "${syswow64}/dxgi.dll"}
-            ]
+          # files[] is derived from the DLLs the build actually produced.
+          # It used to be hardcoded, which silently drifted from the source
+          # tree: DXVK 2.4.1 builds d3d10core but not d3d10/d3d10_1 (those
+          # targets only exist in 1.10.3), and it builds d3d8 which the
+          # hardcoded list omitted. A profile referencing a missing source
+          # breaks the install, so never hand-maintain this list.
+          python3 - << 'PYEOF'
+          import glob, json, os, sys
+
+          files = []
+          for arch in ("system32", "syswow64"):
+              if not os.path.isdir(arch):
+                  raise SystemExit(f"ERROR: missing DLL directory {arch}/")
+              dlls = sorted(glob.glob(os.path.join(arch, "*.dll")))
+              if not dlls:
+                  raise SystemExit(f"ERROR: no DLLs found in {arch}/")
+              for dll in dlls:
+                  name = os.path.basename(dll)
+                  files.append({
+                      "source": f"{arch}/{name}",
+                      "target": "${{{0}}}/{1}".format(arch, name),
+                  })
+
+          vcode = os.environ["VCODE"]
+          profile = {
+              "type": "DXVK",
+              "versionName": "pandxvk-" + os.environ["VNAME"],
+              "versionCode": int(vcode) if vcode.isdigit() else vcode,
+              "description": os.environ["VDESC"],
+              "files": files,
           }
-          JSONEOF
+          with open("profile.json", "w", encoding="utf-8") as fh:
+              json.dump(profile, fh, indent=2, ensure_ascii=False)
+              fh.write("\n")
+          print("profile.json: {0} file entries".format(len(files)))
+          PYEOF
           tar --zstd -cf "../pandxvk-${{ steps.version.outputs.version_name }}.wcp" \
             system32/ syswow64/ profile.json
 
