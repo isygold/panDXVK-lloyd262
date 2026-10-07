@@ -21,6 +21,11 @@ on:
 
 permissions:
   actions: read
+  # Required on a PRIVATE repo: with `actions: read` alone, `contents` is
+  # `none` and actions/checkout falls back to an anonymous fetch. That
+  # succeeds on a public repo (panDXVK) and fails here with
+  # "Repository not found".
+  contents: read
 
 jobs:
   build:
