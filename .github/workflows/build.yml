@@ -64,6 +64,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          submodules: recursive
           fetch-depth: 0
 
       # The container runs as root while the workspace is owned by the runner
@@ -129,6 +130,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          submodules: recursive
           fetch-depth: 0
 
       # The container runs as root while the workspace is owned by the runner
