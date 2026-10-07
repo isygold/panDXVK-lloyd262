@@ -252,7 +252,29 @@ namespace dxvk {
     VkFormat GetPackedFormat() const {
       return m_packedFormat;
     }
-    
+
+    /**
+     * \brief Returns the format of the texture's VkImage, if any
+     *
+     * panDXVK v5: this is the ASTC format only when the texture is a
+     * BC→ASTC remapped texture that actually owns a VkImage
+     * (map mode != STAGING). For all other textures, including remapped
+     * STAGING resources, it is identical to GetPackedFormat().
+     *
+     * Therefore (GetDataFormat() != GetPackedFormat()) is the canonical
+     * "this texture's image is ASTC" predicate used by the transcode
+     * seams (UpdateTexture, CopyImage, UnmapImage, initializer).
+     *
+     * Map/staging layout math must NOT use this: mapped buffers always
+     * hold app-visible (BC) data and use GetPackedFormat().
+     * \returns Image Vulkan format, or the packed format when no image
+     */
+    VkFormat GetDataFormat() const {
+      return m_transcodedFormat != VK_FORMAT_UNDEFINED
+        ? m_transcodedFormat
+        : m_packedFormat;
+    }
+
     /**
      * \brief Checks whether the resource is eligible for tracking
      *
@@ -492,7 +514,12 @@ namespace dxvk {
     D3D11_COMMON_TEXTURE_MAP_MODE m_mapMode;
     DXGI_USAGE                    m_dxgiUsage;
     VkFormat                      m_packedFormat;
-    
+    // panDXVK v5: ASTC format set only for remapped textures that own a
+    // VkImage (map mode != STAGING); UNDEFINED otherwise (staging stays BC).
+    // Gates every CPU→image transcode seam via GetDataFormat() !=
+    // GetPackedFormat(). Never used for layout math.
+    VkFormat                      m_transcodedFormat = VK_FORMAT_UNDEFINED;
+
     Rc<DxvkImage>                 m_image;
     std::vector<MappedBuffer>     m_buffers;
     std::vector<MappedInfo>       m_mapInfo;

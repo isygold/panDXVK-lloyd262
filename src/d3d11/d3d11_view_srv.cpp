@@ -4,6 +4,8 @@
 #include "d3d11_texture.h"
 #include "d3d11_view_srv.h"
 
+#include "../util/util_bc_to_astc.h"
+
 namespace dxvk {
   
   D3D11ShaderResourceView::D3D11ShaderResourceView(
@@ -80,6 +82,24 @@ namespace dxvk {
       viewInfo.aspect  = formatInfo.Aspect;
       viewInfo.swizzle = formatInfo.Swizzle;
       viewInfo.usage   = VK_IMAGE_USAGE_SAMPLED_BIT;
+
+      // panDXVK: Remap BC→ASTC format for PanVK image views.
+      // Shared gate — must not drift from the texture ctor, or a non-remapped
+      // BC image gets an ASTC view format.
+      if (pDevice->GetDXVKDevice()->adapter()->isPanVkTranscode()
+          && util::isBcFormat(pDesc->Format)) {
+        VkFormat astcFormat = util::bcToAstcFormat(pDesc->Format);
+        if (astcFormat != VK_FORMAT_UNDEFINED) {
+          // Functional marker (see d3d11_texture.cpp): proof in a tester log
+          // that the SRV was remapped. Kept out of #ifndef NDEBUG for the
+          // same reason; runtime-gated so the default build pays nothing.
+          if (Logger::logLevel() >= LogLevel::Debug) {
+            Logger::debug(str::format(
+              "panDXVK: SRV BC→ASTC DXGI_FORMAT=", pDesc->Format));
+          }
+          viewInfo.format = astcFormat;
+        }
+      }
 
       // Shaders expect the stencil value in the G component
       if (viewInfo.aspect == VK_IMAGE_ASPECT_STENCIL_BIT) {

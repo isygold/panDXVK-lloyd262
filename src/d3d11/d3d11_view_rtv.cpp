@@ -4,6 +4,8 @@
 #include "d3d11_texture.h"
 #include "d3d11_view_rtv.h"
 
+#include "../util/util_bc_to_astc.h"
+
 namespace dxvk {
   
   D3D11RenderTargetView::D3D11RenderTargetView(
@@ -27,7 +29,27 @@ namespace dxvk {
     viewInfo.aspect  = lookupFormatInfo(viewInfo.format)->aspectMask;
     viewInfo.swizzle = formatInfo.Swizzle;
     viewInfo.usage   = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-    
+
+    // panDXVK: Remap BC→ASTC format for PanVK RTV image views.
+    // Shared gate — must not drift from the texture ctor, or a non-remapped
+    // BC image gets an ASTC view format.
+    if (pDevice->GetDXVKDevice()->adapter()->isPanVkTranscode()
+        && util::isBcFormat(pDesc->Format)) {
+      VkFormat astcFormat = util::bcToAstcFormat(pDesc->Format);
+      if (astcFormat != VK_FORMAT_UNDEFINED) {
+        // Functional marker (see d3d11_texture.cpp): proof in a tester log
+        // that a render-target view was remapped. Kept out of
+        // #ifndef NDEBUG for the same reason; runtime-gated so the default
+        // build pays nothing.
+        if (Logger::logLevel() >= LogLevel::Debug) {
+          Logger::debug(str::format(
+            "panDXVK: RTV BC→ASTC DXGI_FORMAT=", pDesc->Format));
+        }
+        viewInfo.format = astcFormat;
+        viewInfo.aspect = lookupFormatInfo(astcFormat)->aspectMask;
+      }
+    }
+
     switch (pDesc->ViewDimension) {
       case D3D11_RTV_DIMENSION_TEXTURE1D:
         viewInfo.type       = VK_IMAGE_VIEW_TYPE_1D;

@@ -5,6 +5,8 @@
 #include "dxvk_device.h"
 #include "dxvk_instance.h"
 
+#include "../util/util_env.h"
+
 namespace dxvk {
 
   DxvkDeviceQueue getDeviceQueue(const Rc<vk::DeviceFn>& vkd, uint32_t family, uint32_t index) {
@@ -164,6 +166,15 @@ namespace dxvk {
     queues.sparse = sparseQueue;
     return queues;
   }
+
+
+  bool DxvkAdapter::isPanVkTranscode() const {
+    return isPanVk()
+      && m_deviceFeatures.core.features.textureCompressionASTC_LDR
+      && (util::forceTranscodeEnabled()
+          || !m_deviceFeatures.core.features.textureCompressionBC);
+  }
+
 
 #define CHECK_FEATURE_NEED(feature) \
   (m_deviceFeatures.feature         \
