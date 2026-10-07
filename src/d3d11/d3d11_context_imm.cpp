@@ -5,6 +5,7 @@
 #include "d3d11_texture.h"
 
 #include "../util/util_win32_compat.h"
+#include "../util/util_bc_to_astc.h"
 
 constexpr static uint32_t MinFlushIntervalUs = 750;
 constexpr static uint32_t IncFlushIntervalUs = 250;
@@ -649,6 +650,58 @@ namespace dxvk {
 
     auto subresourceLayout = pResource->GetSubresourceLayout(formatInfo->aspectMask, Subresource);
 
+    // panDXVK v5 — Map/Unmap CPU ingress seam.
+    //
+    // The mapped buffer holds app-visible BC bytes while the VkImage is
+    // ASTC, so transcode right here, at the CPU->image boundary, before
+    // copyBufferToImage. Transcoding is done once over the WHOLE
+    // subresource rather than just the dirty region: dirty regions are not
+    // guaranteed to be 4x4-block aligned, whereas the BC subresource layout
+    // and the tight ASTC output both are. This matches the proven behaviour
+    // of the staging path (upload the full mip), at the cost of copying
+    // blocks the application did not touch.
+    DxvkBufferSlice  transcodeSlice;
+    VkOffset3D       transcodeDstOffset = region.Offset;
+    VkExtent3D       transcodeExtent    = region.Extent;
+    VkDeviceSize     transcodeOffset    = 0;
+    VkDeviceSize     transcodeRowPitch  = subresourceLayout.RowPitch;
+    VkDeviceSize     transcodeDepthPitch= subresourceLayout.DepthPitch;
+
+    if (pResource->GetDataFormat() != pResource->GetPackedFormat()
+     && formatInfo->aspectMask == VK_IMAGE_ASPECT_COLOR_BIT) {
+      VkExtent3D mipExtent = pResource->MipLevelExtent(subresource.mipLevel);
+
+      DxvkBufferSlice srcSlice(pResource->GetMappedBuffer(Subresource));
+      auto bcLayout = pResource->GetSubresourceLayout(formatInfo->aspectMask, Subresource);
+
+      VkDeviceSize astcRowPitch   = ((static_cast<VkDeviceSize>(mipExtent.width)  + 3) / 4) * 16;
+      VkDeviceSize astcSlicePitch = util::computeAstcImageDataSize(
+        mipExtent.width, mipExtent.height);
+
+      DxvkBufferSlice dstSlice = AllocStagingBuffer(
+        astcSlicePitch * VkDeviceSize(mipExtent.depth));
+
+      auto* dstPtr = static_cast<uint8_t*>(dstSlice.mapPtr(0));
+      auto* srcPtr = static_cast<const uint8_t*>(srcSlice.mapPtr(0))
+                   + bcLayout.Offset;
+
+      // Transcode is 2D-only: run it once per depth slice.
+      for (uint32_t z = 0; z < mipExtent.depth; z++) {
+        util::transcodeBcToAstc(pResource->Desc()->Format,
+          srcPtr + VkDeviceSize(z) * bcLayout.DepthPitch,
+          mipExtent.width, mipExtent.height, bcLayout.RowPitch,
+          dstPtr + VkDeviceSize(z) * astcSlicePitch,
+          0 /* dstRowPitch 0 → core derives tight ASTC row pitch */);
+      }
+
+      transcodeSlice      = std::move(dstSlice);
+      transcodeDstOffset  = VkOffset3D { 0, 0, 0 };
+      transcodeExtent     = mipExtent;
+      transcodeOffset     = 0;
+      transcodeRowPitch   = astcRowPitch;
+      transcodeDepthPitch = astcSlicePitch;
+    }
+
     // Update dirty region one aspect at a time, due to
     // how the data is laid out in the staging buffer.
     for (uint32_t i = 0; i < pResource->GetPlaneCount(); i++) {
@@ -660,12 +713,16 @@ namespace dxvk {
       EmitCs([
         cDstImage       = pResource->GetImage(),
         cDstSubresource = subresource,
-        cDstOffset      = region.Offset,
-        cDstExtent      = region.Extent,
-        cSrcBuffer      = pResource->GetMappedBuffer(Subresource),
-        cSrcOffset      = pResource->ComputeMappedOffset(Subresource, i, region.Offset),
-        cSrcRowPitch    = subresourceLayout.RowPitch,
-        cSrcDepthPitch  = subresourceLayout.DepthPitch,
+        cDstOffset      = transcodeDstOffset,
+        cDstExtent      = transcodeExtent,
+        cSrcBuffer      = transcodeSlice.buffer() != nullptr
+                        ? transcodeSlice.buffer()
+                        : pResource->GetMappedBuffer(Subresource),
+        cSrcOffset      = transcodeSlice.buffer() != nullptr
+                        ? transcodeOffset
+                        : pResource->ComputeMappedOffset(Subresource, i, region.Offset),
+        cSrcRowPitch    = transcodeRowPitch,
+        cSrcDepthPitch  = transcodeDepthPitch,
         cPackedFormat   = pResource->GetPackedFormat()
       ] (DxvkContext* ctx) {
         if (cDstSubresource.aspectMask != (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) {
