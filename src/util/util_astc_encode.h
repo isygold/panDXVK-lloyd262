@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
@@ -11,6 +12,11 @@
 
 namespace dxvk::util {
 
+  // panDXVK: the counters are atomic because transcodeBcBlocksToAstc() encodes
+  // block rows on a worker pool, and encodeAstcBlock4x4() increments them from
+  // every worker. relaxed is sufficient: nothing here orders other memory, and
+  // dump() is only reached from the serial tail of the transcode, after every
+  // worker has been joined.
   /**
    * \brief ASTC encoder statistics
    *
@@ -36,18 +42,18 @@ namespace dxvk::util {
    * alongside a code path that can actually reach it.
    */
   struct AstcEncodeStats {
-    uint32_t totalBlocks    = 0;
-    uint32_t uniformBlocks  = 0;
-    uint32_t directBlocks   = 0;  // CEM 12 (RGBA direct)
+    std::atomic<uint32_t> totalBlocks    { 0 };
+    std::atomic<uint32_t> uniformBlocks  { 0 };
+    std::atomic<uint32_t> directBlocks   { 0 };  // CEM 12 (RGBA direct)
 
     void dump() const {
       // Logger::debug, not fprintf: the counters only matter when someone is
       // reading the log, and the rest of the panDXVK markers go through
       // Logger, so a single grep finds all of them.
       Logger::debug(str::format(
-        "[panDXVK ASTC encode] total=", totalBlocks,
-        " uniform=", uniformBlocks,
-        " direct=", directBlocks));
+        "[panDXVK ASTC encode] total=", totalBlocks.load(std::memory_order_relaxed),
+        " uniform=", uniformBlocks.load(std::memory_order_relaxed),
+        " direct=", directBlocks.load(std::memory_order_relaxed)));
     }
   };
 

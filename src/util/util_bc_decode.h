@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <algorithm>
@@ -241,15 +242,19 @@ namespace dxvk::util {
   // ============================================================
   // Debug logging for BC7 decode (debug builds only)
   // ============================================================
+  // panDXVK: atomic because decodeBcBlock() runs concurrently on the worker
+  // pool inside transcodeBcBlocksToAstc(). relaxed suffices — these are tallies
+  // with no ordering role, and dump() is called from the serial tail only.
   struct Bc7DecodeStats {
-    uint32_t modeCounts[8]    = {};  // How many blocks per mode
-    uint32_t unhandledBlocks  = 0;   // Blocks with unimplemented modes
-    uint32_t totalBlocks      = 0;
+    std::atomic<uint32_t> modeCounts[8]    = {};  // How many blocks per mode
+    std::atomic<uint32_t> unhandledBlocks  { 0 }; // Blocks with unimplemented modes
+    std::atomic<uint32_t> totalBlocks      { 0 };
 
     void reset() {
-      for (int i = 0; i < 8; i++) modeCounts[i] = 0;
-      unhandledBlocks = 0;
-      totalBlocks = 0;
+      for (int i = 0; i < 8; i++)
+        modeCounts[i].store(0, std::memory_order_relaxed);
+      unhandledBlocks.store(0, std::memory_order_relaxed);
+      totalBlocks.store(0, std::memory_order_relaxed);
     }
 
     void dump() const {
@@ -257,15 +262,18 @@ namespace dxvk::util {
       // transcodeBcToAstc), so this never runs in an ordinary session.
       // Was inside #ifndef NDEBUG, which compiled it out of release builds
       // entirely — including the counters below, so it printed zeros.
-      Logger::debug(str::format("[panDXVK] BC7 decode stats: total=", totalBlocks));
+      const uint32_t total = totalBlocks.load(std::memory_order_relaxed);
+      Logger::debug(str::format("[panDXVK] BC7 decode stats: total=", total));
       for (int i = 0; i < 8; i++) {
-        if (modeCounts[i]) {
-          double pct = totalBlocks ? 100.0 * modeCounts[i] / totalBlocks : 0.0;
-          Logger::debug(str::format("  mode ", i, ": ", modeCounts[i], " blocks (", pct, "%)"));
+        const uint32_t count = modeCounts[i].load(std::memory_order_relaxed);
+        if (count) {
+          double pct = total ? 100.0 * count / total : 0.0;
+          Logger::debug(str::format("  mode ", i, ": ", count, " blocks (", pct, "%)"));
         }
       }
-      if (unhandledBlocks)
-        Logger::debug(str::format("  unhandled: ", unhandledBlocks, " blocks"));
+      const uint32_t unhandled = unhandledBlocks.load(std::memory_order_relaxed);
+      if (unhandled)
+        Logger::debug(str::format("  unhandled: ", unhandled, " blocks"));
     }
   };
 

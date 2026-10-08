@@ -1,10 +1,13 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
 #include <memory>
+#include <thread>
+#include <vector>
 #include "../dxvk/dxvk_format.h"
 #include "util_env.h"
 #include "util_bc_decode.h"
@@ -282,8 +285,57 @@ namespace dxvk::util {
    * \param [in] height         Image height in pixels
    * \param [in] srcBlockPitch  Source block pitch in bytes (0 = derive)
    * \param [out] dstData       Destination ASTC data
-   * \param [in] dstRowPitch    Destination row pitch in bytes (0 = derive)
+    * \param [in] dstRowPitch    Destination row pitch in bytes (0 = derive)
+    */
+  /**
+   * \brief Worker count for the parallel block encode in
+   *        transcodeBcBlocksToAstc()
+   *
+   * Returns 1 — and therefore the original serial loop — for both "too small
+   * for threads to pay" and an explicit PANDXVK_TRANSCODE_THREADS=1, which is
+   * the kill-switch for this change.
+   *
+   * The threshold is 1024 blocks (64x64). At the measured ~2.95 us/block that
+   * is ~3.0 ms of work against roughly 25 us of pthread_create on the target
+   * device, so the pool pays for itself from there up and does not below it.
+   * Under it the serial path is also bit-for-bit the code that shipped before
+   * this change, which keeps the common small-texture case untouched.
+   *
+   * \param [in] blockRows  Rows to hand out — the unit of the split
+   * \param [in] blockCount Total blocks, i.e. the amount of work
+   * \returns               1 (serial) or a worker count of at most 8
    */
+  inline uint32_t transcodeWorkerCount(uint32_t blockRows, uint32_t blockCount) {
+    constexpr uint32_t MinBlocksForThreads = 1024u;
+    constexpr uint32_t MaxWorkers          = 8u;
+
+    if (blockCount < MinBlocksForThreads)
+      return 1u;
+
+    uint32_t workers;
+    const std::string threadsVar = env::getEnvVar("PANDXVK_TRANSCODE_THREADS");
+
+    if (!threadsVar.empty()) {
+      if (threadsVar == "1")
+        return 1u;
+
+      const unsigned long parsed = std::strtoul(threadsVar.c_str(), nullptr, 10);
+      workers = parsed != 0 ? static_cast<uint32_t>(parsed) : 1u;
+    } else {
+      workers = std::thread::hardware_concurrency();
+      if (!workers)
+        workers = 1u;
+    }
+
+    // Never more workers than there are rows to hand out, and never more
+    // than the cap that stops an 8-core phone oversubscribing itself on a
+    // texture upload that is already competing with the render thread.
+    workers = std::min(workers, blockRows);
+    workers = std::min(workers, MaxWorkers);
+    return std::max(workers, 1u);
+  }
+
+
   inline void transcodeBcBlocksToAstc(
           BcFormat       bc,
           bool           remapR,
@@ -306,60 +358,106 @@ namespace dxvk::util {
     if (dstRowPitch == 0)
       dstRowPitch = static_cast<VkDeviceSize>(blockWidth) * 16;
 
-    uint8_t decoded[64];    // one 4x4 RGBA8 block from the BC decoder
-    uint8_t encPixels[64];  // clamp-gathered input for the ASTC encoder
-    uint8_t astcBlock[16];
+    // ── panDXVK: worker-pool block encode ────────────────────────────── //
+    //
+    // Every block is independent: it reads only its own blockSizeBytes of
+    // srcData and writes dstData + by*dstRowPitch + bx*16. Splitting by ROW
+    // (by) therefore hands each worker disjoint destination lines, so no two
+    // workers can touch the same byte — which is also why the per-block
+    // scratch buffers live inside the lambda rather than out here.
+    //
+    // Not a micro-optimisation. Measured on this encoder at -O2 with
+    // non-uniform content, every BC format costs ~2.95 us/block, and GTA V's
+    // streaming path created 9387 textures in one session — 62144
+    // subresources, 125.7M blocks, 368 s of CPU on one thread. A single
+    // 2048x2048 BC2 upload blocked the render thread for 786 ms, about 47
+    // dropped frames at 60 fps.
+    //
+    // PANDXVK_TRANSCODE_THREADS=1 forces the serial branch below, which is
+    // the original loop. That is the rollback for this change.
+    auto encodeRows = [=](uint32_t byBegin, uint32_t byEnd) {
+      uint8_t decoded[64];    // one 4x4 RGBA8 block from the BC decoder
+      uint8_t encPixels[64];  // clamp-gathered input for the ASTC encoder
+      uint8_t astcBlock[16];
 
-    for (uint32_t by = 0; by < blockHeight; by++) {
-      for (uint32_t bx = 0; bx < blockWidth; bx++) {
-        const uint8_t* srcBlock = srcData
-          + static_cast<VkDeviceSize>(by) * srcBlockPitch
-          + static_cast<VkDeviceSize>(bx) * blockSizeBytes;
+      for (uint32_t by = byBegin; by < byEnd; by++) {
+        for (uint32_t bx = 0; bx < blockWidth; bx++) {
+          const uint8_t* srcBlock = srcData
+            + static_cast<VkDeviceSize>(by) * srcBlockPitch
+            + static_cast<VkDeviceSize>(bx) * blockSizeBytes;
 
-        decodeBcBlock(bc, srcBlock, decoded, bc6hSigned);
+          decodeBcBlock(bc, srcBlock, decoded, bc6hSigned);
 
-        // Gather with clamp-to-edge. Interior blocks (the common case)
-        // encode straight from the decoded pixels; edge blocks replicate
-        // the border pixel exactly like encodeAstcImage4x4's gather.
-        const uint8_t* encSrc = decoded;
-        if (bx * 4 + 4 > width || by * 4 + 4 > height) {
-          for (uint32_t py = 0; py < 4; py++) {
-            const uint32_t cy = std::min(by * 4 + py, height - 1) - by * 4;
-            for (uint32_t px = 0; px < 4; px++) {
-              const uint32_t cx = std::min(bx * 4 + px, width - 1) - bx * 4;
-              const uint32_t s = (cy * 4 + cx) * 4;
-              const uint32_t d = (py * 4 + px) * 4;
-              encPixels[d + 0] = decoded[s + 0];
-              encPixels[d + 1] = decoded[s + 1];
-              encPixels[d + 2] = decoded[s + 2];
-              encPixels[d + 3] = decoded[s + 3];
+          // Gather with clamp-to-edge. Interior blocks (the common case)
+          // encode straight from the decoded pixels; edge blocks replicate
+          // the border pixel exactly like encodeAstcImage4x4's gather.
+          const uint8_t* encSrc = decoded;
+          if (bx * 4 + 4 > width || by * 4 + 4 > height) {
+            for (uint32_t py = 0; py < 4; py++) {
+              const uint32_t cy = std::min(by * 4 + py, height - 1) - by * 4;
+              for (uint32_t px = 0; px < 4; px++) {
+                const uint32_t cx = std::min(bx * 4 + px, width - 1) - bx * 4;
+                const uint32_t s = (cy * 4 + cx) * 4;
+                const uint32_t d = (py * 4 + px) * 4;
+                encPixels[d + 0] = decoded[s + 0];
+                encPixels[d + 1] = decoded[s + 1];
+                encPixels[d + 2] = decoded[s + 2];
+                encPixels[d + 3] = decoded[s + 3];
+              }
             }
+            encSrc = encPixels;
           }
-          encSrc = encPixels;
-        }
 
-        // SNORM→UNORM remap for BC4/BC5 SNORM. BC4_SNORM stores signed
-        // normalized values ([-1,1]) as uint8 bytes in R; BC5_SNORM in
-        // R and G. ASTC is UNORM-only: unorm = (int8_t)snorm + 128.
-        // Per-pixel function, so remap-after-gather == remap-then-gather.
-        if (remapR || remapG) {
-          if (encSrc != encPixels)
-            std::memcpy(encPixels, decoded, sizeof(encPixels));
-          for (uint32_t i = 0; i < 16; i++) {
-            uint8_t* px = encPixels + i * 4;
-            if (remapR)
-              px[0] = static_cast<uint8_t>(static_cast<int8_t>(px[0]) + 128);
-            if (remapG)
-              px[1] = static_cast<uint8_t>(static_cast<int8_t>(px[1]) + 128);
+          // SNORM→UNORM remap for BC4/BC5 SNORM. BC4_SNORM stores signed
+          // normalized values ([-1,1]) as uint8 bytes in R; BC5_SNORM in
+          // R and G. ASTC is UNORM-only: unorm = (int8_t)snorm + 128.
+          // Per-pixel function, so remap-after-gather == remap-then-gather.
+          if (remapR || remapG) {
+            if (encSrc != encPixels)
+              std::memcpy(encPixels, decoded, sizeof(encPixels));
+            for (uint32_t i = 0; i < 16; i++) {
+              uint8_t* px = encPixels + i * 4;
+              if (remapR)
+                px[0] = static_cast<uint8_t>(static_cast<int8_t>(px[0]) + 128);
+              if (remapG)
+                px[1] = static_cast<uint8_t>(static_cast<int8_t>(px[1]) + 128);
+            }
+            encSrc = encPixels;
           }
-          encSrc = encPixels;
-        }
 
-        encodeAstcBlock4x4(encSrc, astcBlock);
-        std::memcpy(
-          dstData + static_cast<VkDeviceSize>(by) * dstRowPitch + bx * 16,
-          astcBlock, sizeof(astcBlock));
+          encodeAstcBlock4x4(encSrc, astcBlock);
+          std::memcpy(
+            dstData + static_cast<VkDeviceSize>(by) * dstRowPitch + bx * 16,
+            astcBlock, sizeof(astcBlock));
+        }
       }
+    };
+
+    const uint32_t workers = transcodeWorkerCount(
+      blockHeight, blockWidth * blockHeight);
+
+    if (workers > 1) {
+      const uint32_t rowsPerWorker = (blockHeight + workers - 1) / workers;
+
+      std::vector<std::thread> pool;
+      pool.reserve(workers - 1);
+
+      for (uint32_t w = 0; w + 1 < workers; w++) {
+        const uint32_t byBegin = w * rowsPerWorker;
+        const uint32_t byEnd   = std::min(byBegin + rowsPerWorker, blockHeight);
+        if (byBegin >= byEnd)
+          break;
+        pool.emplace_back(encodeRows, byBegin, byEnd);
+      }
+
+      // The calling thread takes the last slice rather than idling in join(),
+      // so no worker is spent waiting on a core that could be encoding.
+      encodeRows(std::min((workers - 1) * rowsPerWorker, blockHeight), blockHeight);
+
+      for (auto& worker : pool)
+        worker.join();
+    } else {
+      encodeRows(0, blockHeight);
     }
 
     // Periodic stats dumps. This is the one function both callers reach —
@@ -373,13 +471,16 @@ namespace dxvk::util {
     // never ran in any build. The counters always run so the periods stay
     // honest, while the prints are gated on the log level so an ordinary run
     // pays only the increments.
+    // Both counters are atomic for the same reason as the stats structs: two
+    // transcodes issued from different threads share these function-local
+    // statics, and the window is not protected by the worker pool's join.
     if (bc == BcFormat::BC7) {
-      static uint32_t bc7CallCount = 0;
+      static std::atomic<uint32_t> bc7CallCount { 0 };
       if (++bc7CallCount % 1000 == 0 && Logger::logLevel() >= LogLevel::Debug)
         bc7Stats().dump();
     }
 
-    static uint32_t astcCallCount = 0;
+    static std::atomic<uint32_t> astcCallCount { 0 };
     if (++astcCallCount % 10000 == 0 && Logger::logLevel() >= LogLevel::Debug)
       astcStats().dump();
   }
